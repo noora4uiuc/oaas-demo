@@ -1,0 +1,465 @@
+version: '3.8'
+
+# Common configurations
+x-common: &common
+  networks:
+    - oaas-net
+  restart: unless-stopped
+  logging:
+    options:
+      max-size: 50m
+      max-file: "3"
+
+x-clickhouse-defaults: &clickhouse-defaults
+  !!merge <<: *common
+  image: clickhouse/clickhouse-server:25.5.6
+  tty: true
+  labels:
+    signoz.io/scrape: "true"
+    signoz.io/port: "9363"
+    signoz.io/path: "/metrics"
+  depends_on:
+    init-clickhouse:
+      condition: service_completed_successfully
+    zookeeper-1:
+      condition: service_healthy
+  healthcheck:
+    test:
+      - CMD
+      - wget
+      - --spider
+      - -q
+      - 0.0.0.0:8123/ping
+    interval: 30s
+    timeout: 5s
+    retries: 3
+  ulimits:
+    nproc: 65535
+    nofile:
+      soft: 262144
+      hard: 262144
+  environment:
+    - CLICKHOUSE_SKIP_USER_SETUP=1
+
+x-zookeeper-defaults: &zookeeper-defaults
+  !!merge <<: *common
+  image: signoz/zookeeper:3.7.1
+  user: root
+  labels:
+    signoz.io/scrape: "true"
+    signoz.io/port: "9141"
+    signoz.io/path: "/metrics"
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - curl -s -m 2 http://localhost:8080/commands/ruok | grep error | grep null
+    interval: 30s
+    timeout: 5s
+    retries: 3
+
+x-db-depend: &db-depend
+  !!merge <<: *common
+  depends_on:
+    clickhouse:
+      condition: service_healthy
+    schema-migrator-sync:
+      condition: service_completed_successfully
+
+services:
+  # ======================
+  # SigNoz Services
+  # ======================
+  
+  init-clickhouse:
+    !!merge <<: *common
+    image: clickhouse/clickhouse-server:25.5.6
+    container_name: signoz-init-clickhouse
+    command:
+      - bash
+      - -c
+      - |
+        version="v0.0.1"
+        node_os=$$(uname -s | tr '[:upper:]' '[:lower:]')
+        node_arch=$$(uname -m | sed s/aarch64/arm64/ | sed s/x86_64/amd64/)
+        echo "Fetching histogram-binary for $${node_os}/$${node_arch}"
+        cd /tmp
+        wget -O histogram-quantile.tar.gz "https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2F$${version}/histogram-quantile_$${node_os}_$${node_arch}.tar.gz"
+        tar -xvzf histogram-quantile.tar.gz
+        mv histogram-quantile /var/lib/clickhouse/user_scripts/histogramQuantile
+    restart: on-failure
+    volumes:
+      - ./signoz/signoz/deploy/common/clickhouse/user_scripts:/var/lib/clickhouse/user_scripts/
+
+  zookeeper-1:
+    !!merge <<: *zookeeper-defaults
+    container_name: signoz-zookeeper-1
+    volumes:
+      - zookeeper-1:/bitnami/zookeeper
+    environment:
+      - ZOO_SERVER_ID=1
+      - ALLOW_ANONYMOUS_LOGIN=yes
+      - ZOO_AUTOPURGE_INTERVAL=1
+      - ZOO_ENABLE_PROMETHEUS_METRICS=yes
+      - ZOO_PROMETHEUS_METRICS_PORT_NUMBER=9141
+
+  clickhouse:
+    !!merge <<: *clickhouse-defaults
+    container_name: signoz-clickhouse
+    volumes:
+      - ./signoz/signoz/deploy/common/clickhouse/config.xml:/etc/clickhouse-server/config.xml
+      - ./signoz/signoz/deploy/common/clickhouse/users.xml:/etc/clickhouse-server/users.xml
+      - ./signoz/signoz/deploy/common/clickhouse/custom-function.xml:/etc/clickhouse-server/custom-function.xml
+      - ./signoz/signoz/deploy/common/clickhouse/user_scripts:/var/lib/clickhouse/user_scripts/
+      - ./signoz/signoz/deploy/common/clickhouse/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml
+      - clickhouse:/var/lib/clickhouse/
+
+  signoz:
+    !!merge <<: *db-depend
+    image: signoz/signoz:${VERSION:-v0.96.1}
+    container_name: signoz
+    command:
+      - --config=/root/config/prometheus.yml
+    ports:
+      - "3301:8080"
+    volumes:
+      - ./signoz/signoz/deploy/common/signoz/prometheus.yml:/root/config/prometheus.yml
+      - ./signoz/signoz/deploy/common/dashboards:/root/config/dashboards
+      - sqlite:/var/lib/signoz/
+    environment:
+      - SIGNOZ_ALERTMANAGER_PROVIDER=signoz
+      - SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN=tcp://clickhouse:9000
+      - SIGNOZ_SQLSTORE_SQLITE_PATH=/var/lib/signoz/signoz.db
+      - DASHBOARDS_PATH=/root/config/dashboards
+      - STORAGE=clickhouse
+      - GODEBUG=netdns=go
+      - TELEMETRY_ENABLED=true
+      - DEPLOYMENT_TYPE=docker-standalone-amd
+      - DOT_METRICS_ENABLED=true
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --spider
+        - -q
+        - localhost:8080/api/v1/health
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  signoz-otel-collector:
+    !!merge <<: *db-depend
+    image: signoz/signoz-otel-collector:${OTELCOL_TAG:-v0.129.6}
+    container_name: signoz-otel-collector
+    command:
+      - --config=/etc/otel-collector-config.yaml
+      - --manager-config=/etc/manager-config.yaml
+      - --copy-path=/var/tmp/collector-config.yaml
+      - --feature-gates=-pkg.translator.prometheus.NormalizeName
+    volumes:
+      - ./signoz-otel-collector-config.yaml:/etc/otel-collector-config.yaml
+      - ./signoz/signoz/deploy/common/signoz/otel-collector-opamp-config.yaml:/etc/manager-config.yaml
+    environment:
+      - OTEL_RESOURCE_ATTRIBUTES=host.name=signoz-host,os.type=linux
+      - LOW_CARDINAL_EXCEPTION_GROUPING=false
+    ports:
+      - "4317:4317"  # OTLP gRPC receiver
+      - "4318:4318"  # OTLP HTTP receiver
+      - "9411:9411"  # Zipkin receiver
+      - "24225:24225" # Fluentd forward receiver
+    depends_on:
+      signoz:
+        condition: service_healthy
+
+  schema-migrator-sync:
+    !!merge <<: *common
+    image: signoz/signoz-schema-migrator:${OTELCOL_TAG:-v0.129.6}
+    container_name: schema-migrator-sync
+    command:
+      - sync
+      - --dsn=tcp://clickhouse:9000
+      - --up=
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: on-failure
+
+  schema-migrator-async:
+    !!merge <<: *db-depend
+    image: signoz/signoz-schema-migrator:${OTELCOL_TAG:-v0.129.6}
+    container_name: schema-migrator-async
+    command:
+      - async
+      - --dsn=tcp://clickhouse:9000
+      - --up=
+    restart: on-failure
+
+  # ======================
+  # SockShop Services
+  # ======================
+
+  # Front-end service
+  front-end:
+    !!merge <<: *common
+    image: weaveworksdemos/front-end:0.3.12
+    hostname: front-end
+    ports:
+      - "8079:8079"
+    cap_drop:
+      - all
+    read_only: true
+    environment:
+      - reschedule=on-node-failure
+
+  # Edge router
+  edge-router:
+    !!merge <<: *common
+    image: weaveworksdemos/edge-router:0.1.1
+    ports:
+      - "80:80"
+      - "8080:8080"
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    read_only: true
+    tmpfs:
+      - /var/run:rw,noexec,nosuid
+    hostname: edge-router
+    environment:
+      - reschedule=on-node-failure
+    depends_on:
+      - front-end
+
+  # Catalogue service
+  catalogue:
+    !!merge <<: *common
+    image: weaveworksdemos/catalogue:0.3.5
+    hostname: catalogue
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    environment:
+      - reschedule=on-node-failure
+    depends_on:
+      - catalogue-db
+
+  catalogue-db:
+    !!merge <<: *common
+    image: weaveworksdemos/catalogue-db:0.3.0
+    hostname: catalogue-db
+    environment:
+      - MYSQL_ROOT_PASSWORD=fake_password
+      - MYSQL_DATABASE=socksdb
+      - reschedule=on-node-failure
+
+  # Carts service (with tracing)
+  carts:
+    !!merge <<: *common
+    image: weaveworksdemos/carts:0.4.8
+    hostname: carts
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    environment:
+      - JAVA_OPTS=-Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=true -Dspring.zipkin.baseUrl=http://signoz-otel-collector:9411
+      - reschedule=on-node-failure
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: "localhost:24224"
+        tag: "carts"
+        fluentd-async: "true"
+    depends_on:
+      - carts-db
+      - signoz-otel-collector
+      - fluentd
+
+  carts-db:
+    !!merge <<: *common
+    image: mongo:3.4
+    hostname: carts-db
+    cap_drop:
+      - all
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    environment:
+      - reschedule=on-node-failure
+
+  # Orders service (with tracing)
+  orders:
+    !!merge <<: *common
+    image: weaveworksdemos/orders:0.4.7
+    hostname: orders
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    environment:
+      - JAVA_OPTS=-Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=true -Dspring.zipkin.baseUrl=http://signoz-otel-collector:9411
+      - reschedule=on-node-failure
+    depends_on:
+      - orders-db
+      - shipping
+      - signoz-otel-collector
+
+  orders-db:
+    !!merge <<: *common
+    image: mongo:3.4
+    hostname: orders-db
+    cap_drop:
+      - all
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    environment:
+      - reschedule=on-node-failure
+
+  # Shipping service (with tracing)
+  shipping:
+    !!merge <<: *common
+    image: weaveworksdemos/shipping:0.4.8
+    hostname: shipping
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    environment:
+      - JAVA_OPTS=-Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=true -Dspring.zipkin.baseUrl=http://signoz-otel-collector:9411
+      - reschedule=on-node-failure
+    depends_on:
+      - rabbitmq
+      - signoz-otel-collector
+
+  # Queue master
+  queue-master:
+    !!merge <<: *common
+    image: weaveworksdemos/queue-master:0.3.1
+    hostname: queue-master
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    environment:
+      - reschedule=on-node-failure
+    depends_on:
+      - rabbitmq
+
+  # RabbitMQ
+  rabbitmq:
+    !!merge <<: *common
+    image: rabbitmq:3.6.8-management
+    hostname: rabbitmq
+    cap_drop:
+      - all
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    read_only: true
+    tmpfs:
+      - /var/lib/rabbitmq:rw,noexec,nosuid
+    environment:
+      - reschedule=on-node-failure
+
+  # Payment service
+  payment:
+    !!merge <<: *common
+    image: weaveworksdemos/payment:0.4.3
+    hostname: payment
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    environment:
+      - reschedule=on-node-failure
+
+  # User service
+  user:
+    !!merge <<: *common
+    image: weaveworksdemos/user:0.4.7
+    hostname: user
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    environment:
+      - MONGO_HOST=user-db:27017
+      - reschedule=on-node-failure
+    depends_on:
+      - user-db
+
+  user-db:
+    !!merge <<: *common
+    image: weaveworksdemos/user-db:0.4.0
+    hostname: user-db
+    cap_drop:
+      - all
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    environment:
+      - reschedule=on-node-failure
+
+  # Fluentd log collector
+  fluentd:
+    !!merge <<: *common
+    image: fluent/fluentd:latest
+    hostname: fluentd
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    volumes:
+      - ./sockshop/fluent.conf:/fluentd/etc/fluent.conf
+    environment:
+      - FLUENT_UID=0
+
+networks:
+  oaas-net:
+    name: oaas-net
+    driver: bridge
+
+volumes:
+  clickhouse:
+    name: signoz-clickhouse
+  sqlite:
+    name: signoz-sqlite
+  zookeeper-1:
+    name: signoz-zookeeper-1
+

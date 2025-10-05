@@ -1,0 +1,24 @@
+Method,Name,Error,Occurrences
+GET,Browse Catalogue,RemoteDisconnected('Remote end closed connection without response'),6
+POST,Add to Cart,CatchResponseError('Got status 500'),300
+GET,View Cart Before Checkout,RemoteDisconnected('Remote end closed connection without response'),2
+GET,View Product,CatchResponseError('Got status 0'),139
+GET,Homepage,"ConnectionRefusedError(61, 'Connection refused')",68
+POST,Quick Add to Cart,"ConnectionResetError(54, 'Connection reset by peer')",1
+GET,View Cart,RemoteDisconnected('Remote end closed connection without response'),2
+GET,View Cart,"ConnectionRefusedError(61, 'Connection refused')",125
+GET,Browse Catalogue,CatchResponseError('Got status 0'),173
+POST,Quick Add to Cart,"ConnectionRefusedError(61, 'Connection refused')",688
+POST,Checkout,CatchResponseError('Unexpected status 0'),221
+GET,View Cart Before Checkout,"ConnectionRefusedError(61, 'Connection refused')",219
+GET,Homepage,RemoteDisconnected('Remote end closed connection without response'),1
+GET,Quick Browse,RemoteDisconnected('Remote end closed connection without response'),2
+GET,View Product Before Add,RemoteDisconnected('Remote end closed connection without response'),1
+GET,View Product Before Add,"ConnectionRefusedError(61, 'Connection refused')",267
+POST,Add to Cart,CatchResponseError('Got status 0'),268
+GET,Quick Browse,"ConnectionRefusedError(61, 'Connection refused')",219
+GET,View Product,"ConnectionRefusedError(61, 'Connection refused')",412
+GET,Browse Catalogue,"ConnectionRefusedError(61, 'Connection refused')",412
+POST,Quick Add to Cart,HTTPError('500 Server Error: Internal Server Error for url: Quick Add to Cart'),535
+POST,Quick Add to Cart,RemoteDisconnected('Remote end closed connection without response'),4
+GET,View Product,RemoteDisconnected('Remote end closed connection without response'),6

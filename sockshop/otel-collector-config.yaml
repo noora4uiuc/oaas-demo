@@ -1,0 +1,49 @@
+receivers:
+  # Zipkin receiver for Java services (Spring Boot Zipkin format)
+  zipkin:
+    endpoint: 0.0.0.0:9411
+  
+  # Fluentd receiver for logs
+  fluentforward:
+    endpoint: 0.0.0.0:24225
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  
+  # Add resource attributes
+  resource:
+    attributes:
+      - key: service.instance.id
+        from_attribute: host.name
+        action: upsert
+  
+  # Attributes processor for logs
+  attributes:
+    actions:
+      - key: source
+        value: "docker"
+        action: insert
+
+exporters:
+  # Forward to SigNoz
+  otlp:
+    endpoint: host.docker.internal:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    # Traces pipeline
+    traces:
+      receivers: [zipkin]
+      processors: [batch, resource]
+      exporters: [otlp]
+    
+    # Logs pipeline
+    logs:
+      receivers: [fluentforward]
+      processors: [batch, resource, attributes]
+      exporters: [otlp]
+

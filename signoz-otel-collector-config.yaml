@@ -1,0 +1,138 @@
+receivers:
+  # OTLP receiver for direct OpenTelemetry data
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  
+  # Zipkin receiver for Java services (Spring Boot Zipkin format)
+  zipkin:
+    endpoint: 0.0.0.0:9411
+  
+  # Fluentd receiver for logs from SockShop services
+  fluentforward:
+    endpoint: 0.0.0.0:24225
+  
+  # Prometheus receiver for metrics
+  prometheus:
+    config:
+      global:
+        scrape_interval: 60s
+      scrape_configs:
+        - job_name: otel-collector
+          static_configs:
+          - targets:
+              - localhost:8888
+            labels:
+              job_name: otel-collector
+
+processors:
+  batch:
+    send_batch_size: 10000
+    send_batch_max_size: 11000
+    timeout: 10s
+  
+  # Resource detection for system metadata
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 2s
+  
+  # Add resource attributes for better service identification
+  resource:
+    attributes:
+      - key: service.instance.id
+        from_attribute: host.name
+        action: upsert
+      - key: deployment.environment
+        value: "docker-compose"
+        action: upsert
+  
+  # Attributes processor for logs
+  attributes:
+    actions:
+      - key: source
+        value: "docker"
+        action: insert
+      - key: deployment
+        value: "sockshop"
+        action: insert
+  
+  # Span metrics for APM
+  signozspanmetrics/delta:
+    metrics_exporter: signozclickhousemetrics
+    metrics_flush_interval: 60s
+    latency_histogram_buckets: [100us, 1ms, 2ms, 6ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1000ms, 1400ms, 2000ms, 5s, 10s, 20s, 40s, 60s ]
+    dimensions_cache_size: 100000
+    aggregation_temporality: AGGREGATION_TEMPORALITY_DELTA
+    enable_exp_histogram: true
+    dimensions:
+      - name: service.namespace
+        default: default
+      - name: deployment.environment
+        default: default
+      - name: signoz.collector.id
+      - name: service.version
+      - name: browser.platform
+      - name: browser.mobile
+      - name: k8s.cluster.name
+      - name: k8s.node.name
+      - name: k8s.namespace.name
+      - name: host.name
+      - name: host.type
+      - name: container.name
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+exporters:
+  # ClickHouse exporters for SigNoz
+  clickhousetraces:
+    datasource: tcp://clickhouse:9000/signoz_traces
+    low_cardinal_exception_grouping: ${env:LOW_CARDINAL_EXCEPTION_GROUPING}
+    use_new_schema: true
+  
+  signozclickhousemetrics:
+    dsn: tcp://clickhouse:9000/signoz_metrics
+  
+  clickhouselogsexporter:
+    dsn: tcp://clickhouse:9000/signoz_logs
+    timeout: 10s
+    use_new_schema: true
+
+service:
+  telemetry:
+    logs:
+      encoding: json
+  extensions:
+    - health_check
+    - pprof
+  pipelines:
+    # Traces pipeline - handles both OTLP and Zipkin
+    traces:
+      receivers: [otlp, zipkin]
+      processors: [signozspanmetrics/delta, batch, resourcedetection, resource]
+      exporters: [clickhousetraces]
+    
+    # Metrics pipeline - OTLP metrics
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resourcedetection]
+      exporters: [signozclickhousemetrics]
+    
+    # Prometheus metrics pipeline
+    metrics/prometheus:
+      receivers: [prometheus]
+      processors: [batch, resourcedetection]
+      exporters: [signozclickhousemetrics]
+    
+    # Logs pipeline - handles both OTLP and Fluentd
+    logs:
+      receivers: [otlp, fluentforward]
+      processors: [batch, resourcedetection, resource, attributes]
+      exporters: [clickhouselogsexporter]
+
